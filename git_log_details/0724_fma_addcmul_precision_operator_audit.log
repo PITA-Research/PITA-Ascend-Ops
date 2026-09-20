@@ -1,0 +1,106 @@
+commit <TBD>
+Author: ninja <2298831252@qq.com>
+Date:   Fri Jul 24 2026 +0000
+
+    feat: add audited f32 FmaAddcmul custom operator
+
+本记录仅覆盖 Optry 内的 direct CANN 自定义算子实现和审计，不包含 XLA pass、codegen、
+thunk 或业务图接入改动。
+
+目标：
+
+为数值敏感路径提供一个与普通 aclnnAddcmul 名称和语义均不同的 f32 算子：
+
+    p   = RN_f32(value * tensor1)
+    out = RN_f32_fma(p, tensor2, self)
+
+普通 aclnnAddcmul 在该路径上会得到分离 multiply/add rounding，无法复现 CPU fmaf
+残差；真实 capture 的 n=1 与 n=4096 均需要输出 0xb5441280。
+
+主要实现：
+
+1. 新增 FmaAddcmul OpDef 与 AscendC kernel
+   - op_host/fma_addcmul.cpp 注册 f32 ND 输入、f32 scalar、f32 ND 输出，执行静态
+     shape 推导与 tiling
+   - op_kernel/fma_addcmul.cpp 以扁平元素数分 tile；一次 ACLNN 执行只发射一次
+     AICore kernel，workspace 为 0
+   - 第一层 value*tensor1 使用 f32 vector scale；910B vector MAC 无法提供经验证的
+     最终 FMA rounding，因此在同一 kernel 内用 product/two-sum residual 恢复
+     finite-normal 情况的最终 rounding，不将该展开暴露为多个 global-memory thunk
+   - 审计中补充有限 normal 输入乘积溢出的保护：若 product 已为 NaN/Inf/最大有限值，
+     保护分支直接保留 base 运算，避免 residual 中间值污染结果
+
+2. 新增 checked ACLNN wrapper
+   - 自动生成 wrapper 不检查 input/output raw device address overlap；
+     op_host/api/fma_addcmul_api.cpp 替换该算子的生成 wrapper
+   - wrapper 在 GetWorkspaceSize 前验证 ACL_FLOAT、ND、contiguous dense、静态同 shape、
+     offset=0 与 output 不同输入 overlap
+   - 不满足契约返回 161002，且因检查发生在 executor/launch 前，out 不被写入
+   - 公开符号保持 aclnnFmaAddcmulGetWorkspaceSize / aclnnFmaAddcmul
+
+3. 新增 direct ACLNN 回归
+   - tests/ut/fma_addcmul_precision_test.cc 使用 aclrtMemcpy exact bits 和 host
+     std::fmaf reference
+   - 覆盖 capture scalar/batch、16,384 random cancellation、五个 scale random、
+     ordinary random、signed zero、subnormal、NaN、Inf/overflow、有限 normal 乘积溢出、
+     []/[1]/[2]/[4096]/[2,3,4]
+   - 覆盖 f16 tensor、f16 scalar、shape mismatch、broadcast、non-contiguous、output alias
+     拒绝，并检查 out 未写入
+
+4. 新增单算子 benchmark 与文档
+   - tests/benchmark/fma_addcmul_benchmark.cc 以 device event 测 4096 元素、100 warmup、
+     1000 iterations；与普通 aclnnAddcmul 作速度参照
+   - doc/fma_addcmul.md 记录接口、契约、测试、审计结论和性能限制
+   - README.md 与 tests/README.md 增加算子及运行入口
+
+验证（CANN 8.5.0 / Ascend 910B）：
+
+1. 构建和安装通过
+
+    source /usr/local/Ascend/cann-8.5.0/set_env.sh
+    bash ./build.sh
+    ./build_out/custom_opp_openEuler_aarch64.run --quiet \
+      --install-path=/data/CodeSpace/Optry/custom_opp_install
+
+2. 精度与契约回归通过
+
+    ./tests/ut/run_fma_addcmul_precision.sh
+
+   - capture scalar 和 4096 batch 均为 0xb5441280
+   - 所有非 NaN 回归样本与 CPU std::fmaf reference 逐 bit 一致
+   - NaN 分类正确
+   - 所有无效契约测试返回错误且 out 未改变
+   - 有效调用 workspace=0
+
+3. 性能审计（4096 元素）
+
+    ./tests/benchmark/run_fma_addcmul_benchmark.sh
+
+   三次 device-event 复测：
+   - FmaAddcmul: 310.38–310.58 us
+   - ordinary aclnnAddcmul: 5.70–6.69 us
+   - custom/native ratio: 46–54x
+
+审计结论：
+
+- 直接接口的数值、契约和临时产物管理通过当前回归；覆盖输入与 CPU 对齐，但不是全 f32
+  空间穷举证明，NaN payload 不作 bitwise 契约。
+- 当前实现虽为单 kernel、零 workspace，但性能不达高性能验收；不能宣称相对普通
+  aclnnAddcmul 更快，也没有对 4-thunk/20-thunk 直接路径的等价测量。
+- 后续必须在优化 local-buffer/residual/special-value 路径后重跑 bitwise 回归和 benchmark。
+
+涉及文件：
+
+ README.md
+ doc/fma_addcmul.md
+ git_log_details/0724_fma_addcmul_precision_operator_audit.log
+ op_host/CMakeLists.txt
+ op_host/fma_addcmul.cpp
+ op_host/fma_addcmul_tiling.h
+ op_host/api/fma_addcmul_api.cpp
+ op_kernel/fma_addcmul.cpp
+ tests/README.md
+ tests/ut/fma_addcmul_precision_test.cc
+ tests/ut/run_fma_addcmul_precision.sh
+ tests/benchmark/fma_addcmul_benchmark.cc
+ tests/benchmark/run_fma_addcmul_benchmark.sh

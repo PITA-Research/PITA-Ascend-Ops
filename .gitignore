@@ -1,0 +1,42 @@
+# CANN/custom OPP build outputs
+/build_out/
+/custom_opp_install/
+
+# Test build and benchmark outputs
+/tests/ut/bin/
+/tests/benchmark/bin/
+/tests/benchmark/results/
+
+# CMake local state
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CPackConfig.cmake
+CPackSourceConfig.cmake
+Makefile
+
+# Temporary/debug artifacts
+/tmp*/
+*.log
+!/git_log_details/
+!/git_log_details/*.log
+*.dump
+*.csv
+*.bin
+*.o
+*.so
+*.a
+*.run
+*.run.json
+
+# Python/cache files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Editor/OS files
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store

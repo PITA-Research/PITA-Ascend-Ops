@@ -1,0 +1,180 @@
+commit <TBD>
+Author: ninja <2298831252@qq.com>
+Date:   Wed Jul 22 07:55:00 2026 +0000
+
+    feat: add MJX Ascend fp32 dot custom ops with precision tests and benchmark
+
+本提交将 mjx-ascend 整理为面向 MuJoCo JAX（MJX）Ascend 后端的 CANN 自定义算子工程，
+并落地第一批数值敏感算子：两个按最后一维做 row-wise fp32 dot 的自定义 ACLNN
+算子。
+
+背景：
+MJX 中部分 dot 路径对 fp32 规约语义敏感。直接使用 Ascend 原生 lowering 或通用
+算子组合时，会出现与 JAX CPU 参考结果不一致的 fp32 级误差；同时逐 row 调用原生
+aclnnDot 的性能形态也不适合 batch 较大的仿真场景。因此需要一个可维护、可测试、
+可 benchmark 的自定义算子工程，先覆盖 dot 关键路径，后续继续补齐 MJX 需要的其他
+Ascend 算子。
+
+本提交的核心改动包含 6 层：
+
+1. 新增 CANN 自定义 OPP 工程骨架
+   - 增加 CMakeLists.txt、CMakePresets.json、build.sh，支持基于 CANN 8.5.0
+     的自定义 OPP 构建、binary/source package 打包和 custom_opp 安装产物生成
+   - 默认配置：
+     * vendor_name = mjx-ascend
+     * ASCEND_COMPUTE_UNIT = ascend910b
+     * CMAKE_BUILD_TYPE = Release
+     * 构建目录 = build_out
+   - 保留 CMakePresets.json 作为 build.sh 的统一配置入口；build.sh 会通过
+     cmake/util/preset_parse.py 解析 preset，并在 CMake >= 3.19 时使用
+     cmake --preset=default
+   - 引入 CANN AscendC 自定义算子模板所需的 cmake/ 和 scripts/ 辅助脚本，
+     用于 op info 生成、kernel 编译、OPP 打包、安装和升级脚本生成
+
+2. 新增 DotFp32LeftOrderNoNeumaier 算子
+   - Host 侧：
+     * op_host/dot_fp32_left_order_no_neumaier.cpp 注册 GE OpDef
+     * 支持 float32 ND 输入输出
+     * 实现 InferShape / InferDataType / TilingFunc
+     * tiling 下发 batch、dotLen、lhsRowStride、rhsRowStride
+     * blockDim 按 batch clamp 到最多 32 个 core
+   - Kernel 侧：
+     * op_kernel/dot_fp32_left_order_no_neumaier.cpp 实现 AscendC AICore kernel
+     * 每个 core 按 row stride 遍历 batch rows
+     * 将 lhs/rhs 当前 row 拷入 local buffer 后用 scalar fp32 规约，再写回 out
+   - 数值语义：
+     * 该算子不是简单的全程 sum += a * b
+     * 为对齐 MJX dump 中观察到的 JAX CPU AArch64 fp32 dot 行为，当前实现为：
+       - k = 0: 单独 fp32 product
+       - k = 1..7: 分离的 fp32 multiply + fp32 add
+       - k >= 8: fused multiply-add
+     * 该语义用于让 NoNeumaier 与 CPU 参考 dot bitwise 对齐
+
+3. 新增 DotFp32LeftOrderNeumaier 算子
+   - Host 侧与 NoNeumaier 使用同一套 shape、dtype、tiling 和 row stride 语义
+   - Kernel 侧：
+     * op_kernel/dot_fp32_left_order_neumaier.cpp 实现 fp32 Neumaier compensated sum
+     * 每个 product 先进入 fp32 sum，再按 Neumaier 公式累计 compensation
+     * 输出 sum + compensation
+   - 该算子的目标是降低 fp32 dot 的取消误差；由于补偿算法改变规约语义，
+     它与 NoNeumaier / JAX CPU dot 不追求 bitwise 相同
+
+4. 统一并修复 dot shape 语义
+   两个算子当前支持以下最后一维 row-wise dot 形式：
+
+     [K] x [K]                     -> scalar
+     [B..., K] x [K]               -> [B...]
+     [K] x [B..., K]               -> [B...]
+     [B..., K] x [B..., K]         -> [B...]
+
+   约束：
+   - 两个输入最后一维 K 必须一致
+   - 如果两边都是 batched，leading dims 必须完全一致
+   - 如果一边是 [K]，该输入作为共享向量复用于另一边所有 batch row
+   - 当前不支持 batch broadcasting
+
+   实现细节：
+   - vector × vector 时 batch=1，lhs/rhs row stride 都为 0
+   - vector × batched 时 vector 侧 row stride 为 0，batched 侧 row stride 为 K
+   - batched × vector 时 batched 侧 row stride 为 K，vector 侧 row stride 为 0
+   - batched × batched 时两侧 row stride 都为 K
+
+5. 新增精度单测和性能 benchmark
+   - tests/ut/precision_aclnn.cc：
+     * 通过 ACLNN 接口直接调用两个自定义算子
+     * 构造 CPU 参考实现：
+       - CpuDotJaxAarch64Row 对齐 NoNeumaier 的 JAX CPU AArch64 dot 语义
+       - CpuDotNeumaierRow 对齐 Neumaier compensated sum
+       - CpuDotDoubleRow 用于统计相对 float64 dot 的误差
+     * 逐 row 做 bitwise 检查，失败时打印 got/ref 的 float bits
+     * 覆盖 shape：
+       - vector_vector: [18] x [18]
+       - batch_batch_2d: [7,18] x [7,18]
+       - vector_batch_2d: [18] x [7,18]
+       - batch_vector_2d: [7,18] x [18]
+       - batch_batch_3d: [2,3,18] x [2,3,18]
+       - vector_batch_3d: [18] x [2,3,18]
+       - batch_vector_3d: [2,3,18] x [18]
+       - batch1024_batch_2d: [1024,18] x [1024,18]
+       - batch4096_batch_2d: [4096,18] x [4096,18]
+   - tests/benchmark/benchmark_aclnn.cc：
+     * 对比 custom_no_neumaier、custom_neumaier、native_mul_reduce_sum、
+       native_dot_loop 四种路径
+     * 使用 device event 统计 device_avg_us，使用 host steady_clock 统计 host_avg_us
+     * 输出 CSV 到 tests/benchmark/results/dot_perf_results.csv
+     * 覆盖 batch/dot_len：
+       - 1x18, 16x18, 1024x18, 4096x18
+       - 1024x64, 1024x256, 256x1024, 64x4096
+   - tests 目录按用途拆分：
+     * tests/ut/ 放精度和语义单测
+     * tests/benchmark/ 放性能 benchmark
+
+6. 文档和仓库清理
+   - README.md 改为中文，定位为 MJX Ascend 自定义算子库，而不是单一 dot demo
+   - doc/dot_fp32_left_order.md 记录两个 dot 算子的 shape、数值语义、精度验证和
+     benchmark 说明
+   - tests/README.md 记录 UT / benchmark 的运行方式和输出格式
+   - 新增 .gitignore，忽略 build_out、custom_opp_install、测试二进制、
+     benchmark CSV、临时 dump/log/bin/run 等调试产物
+   - 删除/不再保留与当前 MJX ACLNN 接入无关的源码项：
+     * 根目录旧的 dot_fp32_left_order_*.json 调试/中间文件不再作为源码提交；
+       CANN 构建仍会在 build_out/packages/.../kernel/config 下生成同名 JSON
+     * framework/tf_plugin TensorFlow 图转换插件已移除；当前路径通过 ACLNN
+       自定义算子接口验证，不依赖 TensorFlow parser 插件
+     * 旧 debug 测试文件、dump 文件、临时二进制和 benchmark 结果不纳入提交
+
+验证结果：
+
+1. OPP 构建通过
+   命令：
+     source /usr/local/Ascend/cann-8.5.0/set_env.sh
+     bash ./build.sh
+
+   结果：
+     - 生成 DotFp32LeftOrderNoNeumaier / DotFp32LeftOrderNeumaier ascend910b kernel
+     - 生成 libcust_opapi.so、op_proto、op_tiling 和 custom_opp_openEuler_aarch64.run
+     - 删除源码 framework/ 目录后重新构建仍通过
+
+2. 精度单测通过
+   命令：
+     ./tests/ut/run_precision.sh
+
+   结果：
+     - 所有 shape case PASS
+     - NoNeumaier 相对 CPU JAX AArch64 reference 的 max error = 0
+     - Neumaier 相对 CPU Neumaier reference 的 max error = 0
+     - batch=1024、batch=4096 的高误差 dump 对应场景已纳入测试覆盖
+
+3. 性能 benchmark 通过
+   命令：
+     ./tests/benchmark/run_benchmark.sh
+
+   结果：
+     - custom_no_neumaier / custom_neumaier / native_mul_reduce_sum /
+       native_dot_loop 四种路径均可正常执行
+     - CSV 表头：
+       batch,dot_len,elements,variant,iters,device_avg_us,host_avg_us,device_gflops,note
+     - device_avg_us 单位为微秒，表示对应 shape 单次计算的 device event 平均耗时
+
+涉及文件（主体改动 65 files, +10198/-0；不含本记录文件）：
+ .gitignore                                      — 忽略构建、安装、测试和 debug 产物
+ CMakeLists.txt                                  — CANN OPP 顶层构建和打包入口
+ CMakePresets.json                               — 默认 CMake preset 和 Ascend 构建参数
+ README.md                                       — 中文项目说明和运行入口
+ build.sh                                        — CANN 环境检测、preset 解析、构建/打包脚本
+ cmake/**                                        — AscendC 自定义算子构建、代码生成、打包工具
+ scripts/**                                      — OPP 安装、升级和 help 模板
+ op_host/CMakeLists.txt                          — host 侧 op proto/opapi/optiling 构建
+ op_host/dot_fp32_left_order_no_neumaier.cpp     — NoNeumaier OpDef、InferShape、Tiling
+ op_host/dot_fp32_left_order_neumaier.cpp        — Neumaier OpDef、InferShape、Tiling
+ op_host/*_tiling.h                              — tiling data 字段定义
+ op_kernel/CMakeLists.txt                        — AICore kernel 构建入口
+ op_kernel/dot_fp32_left_order_no_neumaier.cpp   — NoNeumaier AICore kernel
+ op_kernel/dot_fp32_left_order_neumaier.cpp      — Neumaier AICore kernel
+ doc/dot_fp32_left_order.md                      — dot 算子详细中文文档
+ tests/README.md                                 — 测试目录说明
+ tests/.gitignore                                — 测试子目录生成物忽略规则
+ tests/ut/precision_aclnn.cc                     — 精度和语义单测
+ tests/ut/run_precision.sh                       — UT 编译运行脚本
+ tests/benchmark/benchmark_aclnn.cc              — 性能 benchmark
+ tests/benchmark/run_benchmark.sh                — benchmark 编译运行脚本
